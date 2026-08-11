@@ -1,0 +1,19 @@
+__pycache__/
+*.pyc
+.DS_Store
+
+# datasets and derived data (not redistributed — see README Datasets section)
+data/
+datasets/*.tar.gz
+datasets/dataset/
+
+# trained weights / run artifacts
+checkpoints/*.pth
+checkpoints/*.pt
+output/
+results/
+hpc/logs/
+
+# session/scratch dumps
+*.txt
+!requirements.txt

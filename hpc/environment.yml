@@ -1,0 +1,17 @@
+name: anyface
+channels:
+  - conda-forge
+  - nvidia
+  - pytorch
+dependencies:
+  - python=3.11
+  - pytorch::pytorch>=2.1
+  - pytorch::torchvision>=0.16
+  - pytorch::pytorch-cuda>=12.1
+  - pip>=23
+  - numpy>=1.24
+  - opencv>=4.8
+  - pillow>=10
+  - matplotlib>=3.7
+  - pip:
+      - ultralytics>=8.3.45

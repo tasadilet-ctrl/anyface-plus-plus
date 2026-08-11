@@ -1,0 +1,9 @@
+# AnyFace++ MTL Dataset Config (absolute paths)
+train:
+  - /data/home/<user>/srp/anyface-orig/datasets/dataset/RAFdbex/train
+val:
+  - /data/home/<user>/srp/anyface-orig/datasets/dataset/RAFdbex/val
+
+nc: 1
+kpt_shape: [5, 3]
+names: ["face"]
