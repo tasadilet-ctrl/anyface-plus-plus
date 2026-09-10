@@ -1,10 +1,53 @@
 # Anyface++
 
+[![CI](https://github.com/tasadilet-ctrl/anyface-plus-plus/actions/workflows/ci.yml/badge.svg)](https://github.com/tasadilet-ctrl/anyface-plus-plus/actions/workflows/ci.yml)
+
 > **YOLO26-based face analysis pipeline** — real-time face detection, age estimation, and mood/emotion classification in a single unified framework.
 
 [![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/)
 [![PyTorch](https://img.shields.io/badge/pytorch-≥2.1-ee4c2c.svg)](https://pytorch.org/)
 [![Ultralytics](https://img.shields.io/badge/yolo-yolo26-success.svg)](https://github.com/ultralytics/ultralytics)
+
+## Face weights are required (and why)
+
+`FaceDetector` needs weights that actually have a **face** class:
+
+```bash
+python3 scripts/download_face_model.py   # fetches yolov8n-face.pt (~6 MB)
+```
+
+This used to default to the stock COCO-pretrained `yolo26n.pt`, and `detect()`
+returned *every* box the model produced without filtering by class. COCO has
+no face class, so on Ultralytics' standard `bus.jpg` the detector returned
+five "faces":
+
+| what YOLO actually saw | returned as |
+|---|---|
+| bus | FaceBox 803×520 px, conf 0.88 |
+| person | FaceBox 192×505 px, conf 0.87 |
+| person | FaceBox 123×456 px, conf 0.86 |
+| person | FaceBox 140×485 px, conf 0.85 |
+| person | FaceBox 59×319 px, conf 0.65 |
+
+Those crops were then handed to the age estimator and mood classifier — the
+pipeline would confidently report the age and emotion of a bus. Nothing
+crashed; the output was simply wrong, which is the harder failure to notice.
+
+With proper face weights the same image yields two detections of 37×52 px and
+36×53 px — face-sized, as expected.
+
+Now the detector filters by class, and weights with no face class are rejected
+with an actionable error rather than silently misused:
+
+```
+NotAFaceModelError: These weights have no 'face' class -- they look like a
+general object detector (classes include: person, bicycle, car, ...).
+Fix: run 'python3 scripts/download_face_model.py' ...
+```
+
+If you deliberately want to run against a non-face model, pass
+`face_class_ids=[...]` so the decision is explicit in the code.
+
 
 ## Architecture
 
@@ -50,8 +93,9 @@
 ```bash
 cd anyface-plus-plus
 pip install -r requirements.txt
+python3 scripts/download_face_model.py   # face weights (required)
 
-# Image (auto-downloads yolo26n.pt on first run)
+# Image
 python demo.py image your_photo.jpg --device mps    # Mac
 python demo.py image your_photo.jpg --device cuda   # NVIDIA
 

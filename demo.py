@@ -28,6 +28,7 @@ from pathlib import Path
 
 import cv2
 
+from anyface_pp.models.face_detector import DEFAULT_FACE_WEIGHTS
 from anyface_pp.pipeline import AnyfacePP, FaceResult
 
 SAVE_DIR = Path("output")
@@ -145,7 +146,9 @@ def main():
     ap.add_argument("--device", default="mps",
                     help='Torch device (default: "mps" on Mac, "cuda" on GPU)')
     ap.add_argument("--face-model", default=None,
-                    help="Custom YOLO26 face-detector .pt (default: yolo26n.pt)")
+                    help="Face-detector .pt with a 'face' class "
+                         f"(default: {DEFAULT_FACE_WEIGHTS}; see "
+                         "scripts/download_face_model.py)")
     ap.add_argument("--age-weights", default=None, help="Age-estimator .pth")
     ap.add_argument("--mood-weights", default=None, help="Mood-classifier .pth")
     ap.add_argument("--conf", type=float, default=0.5,
