@@ -1,9 +1,8 @@
-ultralytics>=8.3.45
-torch>=2.1.0
-torchvision>=0.16.0
-opencv-python>=4.8.0
-numpy>=1.24.0
-Pillow>=10.0.0
-matplotlib>=3.7.0
-requests>=2.31.0
-pytest>=7.0
+# Installs the package in editable mode with its runtime dependencies, which
+# are declared once in pyproject.toml so the two cannot drift apart, plus the
+# test dependencies.
+#
+# On a CPU-only machine, install torch first from PyTorch's CPU index to avoid
+# pulling the multi-gigabyte CUDA build:
+#   pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
+-e .[dev]

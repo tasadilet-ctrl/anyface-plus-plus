@@ -17,3 +17,8 @@ hpc/logs/
 # session/scratch dumps
 *.txt
 !requirements.txt
+*.egg-info/
+build/
+dist/
+.pytest_cache/
+*.pt
