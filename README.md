@@ -49,6 +49,88 @@ If you deliberately want to run against a non-face model, pass
 `face_class_ids=[...]` so the decision is explicit in the code.
 
 
+## Age coding, and two bugs that stopped the age branch running at all
+
+The age branch had never executed. Two separate faults sat in front of it:
+
+| fault | symptom |
+|---|---|
+| `age_estimator.py` called `cv2.cvtColor` but never imported `cv2` | `NameError` on the first face, before the network was reached |
+| `_AgeNet` used one `channels` argument as both the input and output width of a residual stage | `RuntimeError`: stage 2 expected 128 channels and received 64 |
+
+Either one is fatal, so `AnyfacePP.run()` could not return for any image
+containing a face, and `train_age.py` died on its first batch. Both are now
+fixed and covered by tests that run a real forward pass.
+
+### The code that turns network outputs into a number
+
+The head predicts independent binary units. How those are decoded decides
+what one wrong unit costs.
+
+The original decoding read the units as the **eight bits of the integer age**,
+weighted 128...1. That is compact, but the place values are doing something
+no classifier should be asked to underwrite:
+
+```
+unit target flips across ages 0..100
+  binary   [0, 1, 3, 6, 12, 25, 50, 100]      <- the last bit is age parity
+  ordinal  all 1                              <- every unit is one step
+```
+
+The weight-1 bit asks the network whether the person's age is odd. The
+weight-128 bit never turns on below age 128, so one of the eight units is dead
+over any realistic range. And because each unit carries its place value, a
+single wrong unit can move the answer by **128 years**.
+
+The default is now an **ordinal (thermometer) code**: unit *k* answers "older
+than *k*?", and the age is the number of units that say yes. Every unit's
+target is a single monotone step, and one wrong unit costs **one year**.
+
+`benchmarks/age_encoding.py` flips each unit independently with probability
+*p* and decodes. CI reruns it on every push:
+
+| p | ordinal MAE | binary MAE | ordinal p99 | binary p99 | ordinal >10 y | binary >10 y |
+|---|---|---|---|---|---|---|
+| 0.001 | 0.10 | 0.23 | 1 | 0 | 0.0% | 0.4% |
+| 0.01 | 0.77 | 2.57 | 3 | **128** | 0.0% | 4.0% |
+| 0.05 | 2.98 | 12.12 | 9 | 128 | 0.2% | 18.5% |
+| 0.10 | 5.48 | 23.68 | 15 | 160 | 9.8% | 34.7% |
+
+At *p* = 0.01 — units that are individually 99% accurate — one binary
+prediction in 25 is more than ten years out, and the 99th percentile error is
+a century. The ordinal code cannot produce that error from a single wrong
+unit.
+
+Note that this comparison is set up in binary's favour: holding *p* equal
+gives the binary code 8 units to the ordinal code's 100, so it suffers fewer
+wrong units in absolute terms. It loses anyway.
+
+### The same result under actual training
+
+`benchmarks/age_encoding_train.py` trains both codes on one identical
+synthetic task — same backbone, same schedule, same images, same seed, only
+the decoding differs. Age is readable straight off image brightness, so
+nothing here is limited by vision:
+
+| encoding | seed 0 | seed 1 | seed 2 | mean |
+|---|---|---|---|---|
+| ordinal | 1.19 | 3.06 | 3.19 | **2.48 y** |
+| binary | 18.56 | 10.62 | 21.62 | **16.93 y** |
+
+Ordinal wins on every seed with no overlap between the two sets of runs. The
+binary runs are also far less repeatable: they span 10.6-21.6 y across the
+three seeds, a range wider than the ordinal runs' entire mean, because one
+bit changing its mind moves the prediction by decades.
+
+This says nothing about accuracy on real faces; the task is a stand-in. It
+says the decoding problem is real in training and not only on paper.
+
+The binary code is still selectable (`--encoding binary`) so the comparison
+can be rerun. A checkpoint records the code it was trained with, and
+`AgeEstimator` decodes it that way regardless of what the caller asks for —
+decoding a binary model as ordinal would return quiet nonsense.
+
+
 ## Architecture
 
 ```
@@ -70,9 +152,9 @@ If you deliberately want to run against a non-face model, pass
 │  │   Age    │  │   Mood    │  │  Visual- │               │
 │  │ Estimator│  │ Classif.  │  │  izer    │               │
 │  │          │  │           │  │          │               │
-│  │ 8-bit    │  │ 7-class   │  │ B boxes  │               │
-│  │ binary   │  │ MobileNet │  │ labels   │               │
-│  │ code CNN │  │ V2        │  │ badges   │               │
+│  │ ordinal  │  │ 7-class   │  │ B boxes  │               │
+│  │ code CNN │  │ MobileNet │  │ labels   │               │
+│  │ (0-100)  │  │ V2        │  │ badges   │               │
 │  └────┬─────┘  └─────┬─────┘  └────┬─────┘               │
 │       │              │              │                     │
 │       ▼              ▼              ▼                    │
@@ -85,7 +167,7 @@ If you deliberately want to run against a non-face model, pass
 | Module | Backbone | Task | Output |
 |--------|----------|------|--------|
 | **Face Detector** | YOLO26n (Ultralytics) | Object detection → faces | Bounding boxes + confidence |
-| **Age Estimator** | Deep Residual CNN (Zhang & Sun, ACCV 2017) | 8-bit binary age code → age regression | Numeric age (0–127) |
+| **Age Estimator** | Pre-activation residual CNN | Ordinal (thermometer) code → age | Numeric age (0–100) |
 | **Mood Classifier** | MobileNetV2 | 7-class emotion classification | `{angry, disgusted, fearful, happy, sad, surprised, neutral}` with probabilities |
 
 ## Quick Start (Local)
@@ -171,6 +253,11 @@ python train_age.py \
     --epochs 50 --batch-size 64 --device cuda
 ```
 
+Holds out `--val-frac` of the data (10% by default), reports validation MAE in
+years each epoch, and keeps the best checkpoint rather than the last. Pass
+`--encoding binary` to train the old code instead; the choice is stored in the
+checkpoint.
+
 ### Mood Classification
 
 CSV with columns `image_path` and `emotion`:
@@ -210,6 +297,10 @@ anyface-plus-plus/
 ├── demo.py                 # CLI demo (image / video / webcam, needs display)
 ├── train_age.py            # Age estimator training script
 ├── train_mood.py           # Mood classifier training script
+├── benchmarks/
+│   ├── age_encoding.py     # Cost of a wrong unit under each age code (CI)
+│   └── age_encoding_train.py  # Both codes trained on one identical task
+├── tests/                  # Offline: no weights, no dataset, no GPU
 ├── scripts/
 │   ├── infer_headless.py   # Headless batch inference (HPC / SSH friendly)
 │   ├── train_age.slurm     # SLURM job for age training
@@ -227,7 +318,7 @@ anyface-plus-plus/
     ├── pipeline.py          # Unified AnyfacePP pipeline orchestrator
     ├── models/
     │   ├── face_detector.py # YOLO26 face detection
-    │   ├── age_estimator.py # 8-bit binary code age CNN
+    │   ├── age_estimator.py # Ordinal-code age CNN
     │   └── mood_classifier.py  # MobileNetV2 emotion classifier
     └── utils/
         └── visualizer.py    # Bounding box + label drawing
@@ -244,7 +335,13 @@ anyface-plus-plus/
 ## References
 
 - **YOLO26** — Ultralytics. <https://github.com/ultralytics/ultralytics>
-- **Deep Residual Learning for Human Age Approximation** — Zhang & Sun, ACCV 2017. <https://arxiv.org/abs/1710.05181>
+- **Ordinal Regression with Multiple Output CNN for Age Estimation** — Niu, Zhou, Wang, Gao & Hua, CVPR 2016.
+  <https://openaccess.thecvf.com/content_cvpr_2016/html/Niu_Ordinal_Regression_With_CVPR_2016_paper.html>
+  Source of the ordinal age coding used here, and of AFAD — the dataset
+  `datasets/prep_afad.py` already prepares. A previous version of this file
+  cited "Deep Residual Learning for Human Age Approximation, Zhang & Sun,
+  ACCV 2017" at arXiv:1710.05181; that identifier belongs to a paper on
+  neutrino spin oscillations, and the citation has been removed.
 - **MobileNetV2** — Sandler et al., CVPR 2018. <https://arxiv.org/abs/1801.04381>
 - **FER2013** — Goodfellow et al., 2013. <https://arxiv.org/abs/1308.0852>
 

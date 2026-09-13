@@ -23,8 +23,8 @@ jobs:
           cache: pip
 
       # CPU-only torch: nothing here needs a GPU, and the CUDA wheel is
-      # several GB. The tests exercise class-resolution logic on plain dicts,
-      # so no model weights are downloaded either.
+      # several GB. The tests build small networks and stub the detector, so
+      # no model weights are downloaded either.
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
@@ -35,7 +35,15 @@ jobs:
       - name: Run tests
         run: pytest tests/ -v
 
+      - name: Recompute the age-code comparison
+        # Reproduces the numbers quoted in the README's "Age coding" section.
+        # Pure arithmetic over the codes -- no data, no weights, deterministic.
+        run: python3 benchmarks/age_encoding.py
+
       - name: Check entry points are importable
         run: |
           python -c "from anyface_pp.models.face_detector import FaceDetector; print('ok')"
+          python -c "from anyface_pp.pipeline import AnyfacePP; print('ok')"
           python scripts/download_face_model.py --help
+          python train_age.py --help > /dev/null
+          python train_mood.py --help > /dev/null

@@ -14,6 +14,7 @@ import logging
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Union
 
+import cv2
 import numpy as np
 import torch
 import torch.nn as nn
@@ -75,7 +76,7 @@ class MoodClassifier:
         self._net.eval()
 
         if weights_path and Path(weights_path).exists():
-            state = torch.load(weights_path, map_location=device, weights_only=False)
+            state = torch.load(weights_path, map_location=device, weights_only=True)
             self._net.load_state_dict(state["model"])
             logger.info("Loaded mood-classifier weights from %s", weights_path)
         else:
@@ -150,6 +151,3 @@ class MoodClassifier:
 
     def __repr__(self) -> str:
         return f"MoodClassifier(device={self._device!r})"
-
-# ---------- standalone import guard for cv2 (used above) ----------
-import cv2  # noqa: E402  (placed here so the module-level cv2 calls in _transform work)
