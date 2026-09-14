@@ -207,6 +207,65 @@ shows.
 wants to push further on the rare classes.
 
 
+## The MTL subtree
+
+`yolo26_mtl/` holds a YOLO26 head that predicts faces, 5 landmarks and three
+face attributes from one backbone. **It had never been executed.** Not the
+head, not the training script, not the inference script — and not the
+verification block inside its own `setup_mtl.sh`, which crashed on the very
+channel widths it hard-coded.
+
+### What was wrong
+
+| | fault | how it showed up |
+|---|---|---|
+| head | attribute `Linear` sized for `ch[1]` but fed the `cv4` output (`c4`) | `RuntimeError: mat1 and mat2 shapes cannot be multiplied (2x25 and 128x128)` on the first forward |
+| head | attributes pooled to one vector per **image** | one gender for a whole group photo; nothing to attach to a detection |
+| head | sigma branch: 10-channel conv reshaped to 5 channels | anchor axis doubled to 16800 against everything else's 8400, silently misaligned |
+| head | `end2end=True` deep-copied branches `forward` never calls | **240,708 dead parameters, +36%**, receiving no gradient |
+| head | `fuse()` set `cv2`/`cv3`/`cv4` to `None` | destroys the detection and keypoint branches |
+| setup | `cp` + `sed` into installed `ultralytics` | undone by any reinstall — and it never registered the head with `parse_model`, so the model could not be built regardless |
+| inference | read `result.mtl` | nothing anywhere sets that attribute; gender/age/emotion were silently absent from every result written |
+| inference | assumed a packed 12-vector layout | the head produced three separate tensors |
+| inference | reported raw logits as `gender_conf` | a "confidence" could be negative |
+| inference | video path used `stream=True`, never consumed the generator | inference never ran; the raw input frame was written to the output file |
+| labels | three emotion lists: 7 here, 8 there, different order | predictions from the two paths could not be compared |
+
+### What it does now
+
+Attributes are predicted **per anchor**, built like the keypoint branch rather
+than as pooled `Linear` layers, and concatenated onto the inference tensor
+after the keypoints. Ultralytics' NMS treats everything past `4 + nc` as
+opaque extra columns and carries it through, so each surviving detection keeps
+its own attribute vector — there is a test that stamps a unique marker into
+every anchor and checks the right one lands on the right row.
+
+`build_mtl_model()` registers the head at runtime for the duration of the
+parse and restores `ultralytics` afterwards, replacing the `cp`/`sed`.
+`yolo26_mtl/scripts/verify_mtl.py` replaces `setup_mtl.sh` and actually runs:
+
+```bash
+python3 yolo26_mtl/scripts/verify_mtl.py
+```
+
+Label sets now live once, in `anyface_pp/labels.py`.
+
+### What is still missing, and it is the important part
+
+**The attribute branches have no loss.** Training through `task="pose"`
+optimises boxes and keypoints; it has no targets for gender, age or emotion
+and never touches those weights, which stay at their initialisation for the
+whole run. Making them learn needs per-face attribute labels in the dataset, a
+loss masked to positive anchors, and a trainer that carries the labels
+through — none of which exist here.
+
+So what this subtree *is*, honestly: a correct, tested multi-task head and a
+working inference path, on top of which a face detector with landmarks can be
+trained today. The attribute outputs are structurally valid and numerically
+meaningless until someone writes that loss. `train_mtl.py` and
+`infer_mtl.py` both say so at the top and at runtime.
+
+
 ## Architecture
 
 ```
@@ -382,6 +441,14 @@ anyface-plus-plus/
 │   ├── age_encoding_train.py  # the same comparison under training
 │   └── mood_metrics.py     # imbalance: accuracy vs macro-F1, split risk
 ├── tests/                  # offline; no weights or datasets required
+├── yolo26_mtl/             # multi-task YOLO26 head (see "The MTL subtree")
+│   ├── __init__.py         # runtime head registration + build_mtl_model
+│   ├── configs/yolo26n-mtl.yaml
+│   ├── head_module/head_mtl.py   # MTLPose: boxes + landmarks + attributes
+│   └── scripts/
+│       ├── verify_mtl.py   # builds and runs the head; no data needed
+│       ├── train_mtl.py    # trains boxes/landmarks only (no attribute loss)
+│       └── infer_mtl.py    # NMS + per-face attribute decode
 ├── benchmarks/
 │   ├── age_encoding.py     # Cost of a wrong unit under each age code (CI)
 │   └── age_encoding_train.py  # Both codes trained on one identical task
@@ -409,6 +476,7 @@ anyface-plus-plus/
         ├── visualizer.py    # Bounding box + label drawing
         ├── metrics.py       # macro-F1, per-class recall, confusion matrix
         └── splits.py        # stratified train/val split
+    └── labels.py            # the one emotion/gender label set
 ```
 
 ## Datasets

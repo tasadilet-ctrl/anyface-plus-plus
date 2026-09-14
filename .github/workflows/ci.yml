@@ -45,6 +45,10 @@ jobs:
         # from FER2013's published class counts. No images needed.
         run: python3 benchmarks/mood_metrics.py
 
+      - name: Verify the MTL head builds and runs
+        # Replaces setup_mtl.sh, whose own verification block had never run.
+        run: python3 yolo26_mtl/scripts/verify_mtl.py
+
       - name: Check entry points are importable
         run: |
           python -c "from anyface_pp.models.face_detector import FaceDetector; print('ok')"
@@ -52,3 +56,5 @@ jobs:
           python scripts/download_face_model.py --help
           python train_age.py --help > /dev/null
           python train_mood.py --help > /dev/null
+          python yolo26_mtl/scripts/train_mtl.py --help > /dev/null
+          python yolo26_mtl/scripts/infer_mtl.py --help > /dev/null

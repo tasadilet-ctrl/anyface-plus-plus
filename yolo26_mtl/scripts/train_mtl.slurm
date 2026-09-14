@@ -27,7 +27,7 @@ mkdir -p hpc/logs
 
 python yolo26_mtl/scripts/train_mtl.py \
     --data datasets/anyface.yaml \
-    --model yolo26n-mtl.yaml \
+    --model yolo26_mtl/configs/yolo26n-mtl.yaml \
     --epochs 300 \
     --batch 16 \
     --imgsz 640 \

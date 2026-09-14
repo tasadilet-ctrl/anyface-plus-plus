@@ -3,7 +3,9 @@
 # Based on yolo26-pose.yaml with MTLPose head
 
 nc: 1
-end2end: True
+# MTLPose does not implement the one2many/one2one contract that end2end
+# requires; see head_mtl.py. Detections go through ordinary NMS.
+end2end: False
 reg_max: 1
 kpt_shape: [5, 3]
 

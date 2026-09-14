@@ -23,15 +23,7 @@ from torchvision.models import MobileNet_V2_Weights, mobilenet_v2
 
 logger = logging.getLogger(__name__)
 
-EMOTION_LABELS = [
-    "angry",
-    "disgusted",
-    "fearful",
-    "happy",
-    "sad",
-    "surprised",
-    "neutral",
-]
+from ..labels import EMOTION_LABELS  # noqa: F401  (re-exported for callers)
 
 INPUT_SIZE = 224
 

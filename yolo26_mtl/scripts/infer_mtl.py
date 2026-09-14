@@ -1,205 +1,214 @@
 #!/usr/bin/env python3
-"""Inference for YOLO26-AnyFace++ MTL model.
+"""Inference for the YOLO26-AnyFace++ MTL model.
 
-Runs face detection + landmarks + gender + age + emotion on images/videos.
-Headless (no GUI) — works on HPC via SSH.
+Face boxes + 5 landmarks + gender/age/emotion per face. Headless.
 
-Example:
     python yolo26_mtl/scripts/infer_mtl.py \
         --weights runs/mtl/exp/weights/best.pt \
-        --source data/test_images/ \
-        --output-dir results/mtl/ \
-        --device cuda
+        --source data/test_images/ --output-dir results/mtl --device cpu
+
+This drives the underlying torch model rather than ``YOLO.predict``. The head
+appends attribute columns after the keypoints, and the stock pose predictor
+knows nothing about them -- the previous version of this file read
+``result.mtl``, an attribute that nothing in ultralytics or in this repo ever
+sets, so gender/age/emotion were silently absent from every result it wrote.
+
+IMPORTANT: the attribute branches have no loss (see the README section "The
+MTL subtree"), so unless you have trained them yourself the values below are
+whatever the initialisation produced. The detection and landmark outputs are
+the parts a pose-trained checkpoint actually optimises.
 """
+
+from __future__ import annotations
 
 import argparse
 import json
+import sys
 from pathlib import Path
 
 import cv2
 import numpy as np
+import torch
 
-from ultralytics import YOLO
+ROOT = Path(__file__).resolve().parent.parent.parent
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
 
-GENDER_LABELS = ["female", "male", "unsure"]
-EMOTION_LABELS = ["angry", "happy", "fear", "sad", "surprise", "disgust", "neutral", "unsure"]
-FACE_LABELS = {0: "human", 1: "animal", 2: "cartoon"}
+from yolo26_mtl import build_mtl_model, registered_mtl_head  # noqa: E402
+from yolo26_mtl.head_module.head_mtl import ATTR_DIM, decode_attrs  # noqa: E402
+
+IMG_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".tiff", ".webp"}
+VIDEO_EXTS = {".mp4", ".avi", ".mov", ".mkv"}
+LANDMARK_COLORS = [(0, 255, 0), (0, 0, 255), (0, 255, 255),
+                   (255, 0, 255), (255, 0, 0)]
 
 
-def predict(image_path, model, conf=0.3, iou=0.1, device="cuda"):
-    """Run inference on a single image."""
-    image = cv2.imread(str(image_path))
-    if image is None:
-        raise FileNotFoundError(f"Cannot read: {image_path}")
+def load_model(weights, device):
+    """Load a trained checkpoint, or build an untrained model from the config."""
+    if weights:
+        with registered_mtl_head():
+            ckpt = torch.load(weights, map_location=device, weights_only=False)
+        model = ckpt["model"] if isinstance(ckpt, dict) and "model" in ckpt else ckpt
+        model = model.float()
+    else:
+        model = build_mtl_model()
+        print("WARNING: no --weights given; running an untrained model. "
+              "Output is structurally valid and numerically meaningless.",
+              file=sys.stderr)
+    return model.to(device).eval()
 
-    results = model.predict(
-        source=image, imgsz=640, conf=conf, iou=iou, device=device, verbose=False
-    )
 
-    h, w, _ = image.shape
+def letterbox(image, imgsz):
+    """Resize preserving aspect ratio, pad to a square. Returns (tensor, ratio, pad)."""
+    h, w = image.shape[:2]
+    r = min(imgsz / h, imgsz / w)
+    nh, nw = int(round(h * r)), int(round(w * r))
+    resized = cv2.resize(image, (nw, nh), interpolation=cv2.INTER_LINEAR)
+    top, left = (imgsz - nh) // 2, (imgsz - nw) // 2
+    canvas = np.full((imgsz, imgsz, 3), 114, dtype=np.uint8)
+    canvas[top:top + nh, left:left + nw] = resized
+    x = torch.from_numpy(canvas[..., ::-1].transpose(2, 0, 1).copy()).float() / 255.0
+    return x.unsqueeze(0), r, (left, top)
+
+
+@torch.no_grad()
+def predict(image, model, head, conf=0.3, iou=0.45, imgsz=640, device="cpu"):
+    """Detect faces in one BGR image and decode each one's attributes."""
+    from ultralytics.utils.nms import non_max_suppression
+
+    x, ratio, (padx, pady) = letterbox(image, imgsz)
+    y = model(x.to(device))
+    y = y[0] if isinstance(y, (tuple, list)) else y
+
+    if head.end2end_flag:
+        # The head already ran top-k postprocess: rows are
+        # [x1,y1,x2,y2, conf, cls, kpts..., attrs...]
+        rows = y[0]
+        rows = rows[rows[:, 4] >= conf]
+    else:
+        dets = non_max_suppression(y, conf_thres=conf, iou_thres=iou, nc=head.nc)
+        rows = dets[0]
+
+    nk = head.nk
+    img_h, img_w = image.shape[:2]
     faces = []
+    for row in rows:
+        row = row.cpu()
+        x1, y1, x2, y2 = ((row[:4].numpy() - [padx, pady, padx, pady]) / ratio)
+        # Clip to the frame: undoing the letterbox can place a predicted box
+        # in the padding, which is not part of the image.
+        x1, x2 = float(np.clip(x1, 0, img_w)), float(np.clip(x2, 0, img_w))
+        y1, y2 = float(np.clip(y1, 0, img_h)), float(np.clip(y2, 0, img_h))
+        kpts = row[6:6 + nk].reshape(-1, 3).numpy()
+        kpts[:, 0] = np.clip((kpts[:, 0] - padx) / ratio, 0, img_w)
+        kpts[:, 1] = np.clip((kpts[:, 1] - pady) / ratio, 0, img_h)
+        face = {
+            "bbox": [int(x1), int(y1), int(x2 - x1), int(y2 - y1)],
+            "confidence": round(float(row[4]), 4),
+            "landmarks": [[round(float(k[0]), 1), round(float(k[1]), 1)]
+                          for k in kpts],
+        }
+        face.update(decode_attrs(row[6 + nk:6 + nk + ATTR_DIM]))
+        faces.append(face)
+    return faces
 
-    for result in results:
-        boxes = result.boxes.cpu().numpy()
-        if len(boxes) == 0:
-            continue
 
-        for i, box in enumerate(boxes):
-            x1, y1, x2, y2 = box.xyxy[0].astype(int)
-            conf_val = float(box.conf[0])
-            label = int(box.cls[0]) if hasattr(box, 'cls') and box.cls is not None else 0
-
-            face = {
-                "bbox": [x1, y1, x2 - x1, y2 - y1],
-                "confidence": round(conf_val, 4),
-                "face_type": FACE_LABELS.get(label, "unknown"),
-            }
-
-            # MTL predictions
-            if hasattr(result, 'mtl') and result.mtl is not None:
-                mtl = result.mtl[i]
-
-                # Gender
-                gender_logits = mtl[0:3].cpu().numpy()
-                gender_idx = np.argmax(gender_logits)
-                face["gender"] = GENDER_LABELS[gender_idx]
-                face["gender_conf"] = round(float(gender_logits[gender_idx]), 4)
-
-                # Age
-                age = int(mtl[3:4][0].cpu().numpy())
-                face["age"] = max(0, min(116, age))
-
-                # Emotion
-                emo_logits = mtl[4:].cpu().numpy()
-                emo_idx = np.argmax(emo_logits)
-                face["emotion"] = EMOTION_LABELS[emo_idx]
-                face["emotion_conf"] = round(float(emo_logits[emo_idx]), 4)
-
-            # Landmarks
-            if hasattr(result, 'keypoints') and result.keypoints is not None:
-                kps = result.keypoints.data[i].cpu().numpy()
-                face["landmarks"] = [
-                    [round(float(kp[0]), 1), round(float(kp[1]), 1)]
-                    for kp in kps
-                ]
-
-            # Annotate
-            font = cv2.FONT_HERSHEY_SIMPLEX
-            fs = max(0.4, min(0.7, (w + h) / 1280))
-            color = (0, 255, 0) if face["face_type"] == "human" else (255, 0, 0)
-            cv2.rectangle(image, (x1, y1), (x2, y2), color, 2)
-            y_off = max(y1 - 5, 15)
-
-            cv2.putText(image, f"Face: {face['face_type']}",
-                        (x1 + 2, y_off), font, fs, (0, 255, 0), 1)
-            y_off += int(h / 30)
-            if "gender" in face:
-                cv2.putText(image, f"Gender: {face['gender']}",
-                            (x1 + 2, y_off), font, fs, (255, 255, 0), 1)
-                y_off += int(h / 30)
-            if "age" in face:
-                cv2.putText(image, f"Age: {face['age']}",
-                            (x1 + 2, y_off), font, fs, (255, 0, 255), 1)
-                y_off += int(h / 30)
-            if "emotion" in face:
-                cv2.putText(image, f"Emotion: {face['emotion']}",
-                            (x1 + 2, y_off), font, fs, (0, 255, 255), 1)
-
-            # Draw landmarks
-            if "landmarks" in face:
-                colors = [(0, 255, 0), (0, 0, 255), (0, 255, 255),
-                          (255, 0, 255), (255, 0, 0)]
-                for k, (lx, ly) in enumerate(face["landmarks"]):
-                    cv2.circle(image, (int(lx), int(ly)), 2,
-                               colors[k % len(colors)], -1)
-
-            faces.append(face)
-
-    return faces, image
+def annotate(image, faces):
+    """Draw boxes, landmarks and attribute labels. Returns a new image."""
+    out = image.copy()
+    font, fs = cv2.FONT_HERSHEY_SIMPLEX, 0.5
+    for f in faces:
+        x, y, w, h = f["bbox"]
+        cv2.rectangle(out, (x, y), (x + w, y + h), (0, 255, 0), 2)
+        lines = [f"face {f['confidence']:.2f}",
+                 f"{f['gender']} {f['gender_conf']:.2f}",
+                 f"age {f['age']}",
+                 f"{f['emotion']} {f['emotion_conf']:.2f}"]
+        for i, text in enumerate(lines):
+            cv2.putText(out, text, (x + 2, max(y - 6 - i * 14, 12 + i * 14)),
+                        font, fs, (0, 255, 255), 1, cv2.LINE_AA)
+        for k, (lx, ly) in enumerate(f["landmarks"]):
+            cv2.circle(out, (int(lx), int(ly)), 2,
+                       LANDMARK_COLORS[k % len(LANDMARK_COLORS)], -1)
+    return out
 
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--weights", "-w", required=True,
-                    help="Path to trained .pt weights")
+    ap.add_argument("--weights", "-w", default=None,
+                    help="trained .pt; omitted builds an untrained model")
     ap.add_argument("--source", "-s", required=True,
-                    help="Image file, video file, or directory")
-    ap.add_argument("--output-dir", "-o", default="results/mtl",
-                    help="Output directory")
+                    help="image file, video file, or directory")
+    ap.add_argument("--output-dir", "-o", default="results/mtl")
     ap.add_argument("--conf", type=float, default=0.3)
-    ap.add_argument("--iou", type=float, default=0.1)
-    ap.add_argument("--device", default="cuda")
+    ap.add_argument("--iou", type=float, default=0.45)
+    ap.add_argument("--imgsz", type=int, default=640)
+    ap.add_argument("--device", default="cpu")
     args = ap.parse_args()
 
     out_dir = Path(args.output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
-
-    # Load model
-    print(f"Loading model: {args.weights}")
-    model = YOLO(args.weights)
-    iou = args.iou
+    model = load_model(args.weights, args.device)
+    head = model.model[-1]
 
     source = Path(args.source)
-    results_all = {}
+    if source.is_dir():
+        images = sorted(f for f in source.iterdir() if f.suffix.lower() in IMG_EXTS)
+    elif source.suffix.lower() in IMG_EXTS:
+        images = [source]
+    elif source.suffix.lower() in VIDEO_EXTS:
+        return run_video(source, model, head, args, out_dir)
+    else:
+        raise SystemExit(f"Unsupported source: {source}")
 
-    # Single image
-    if source.is_file() and source.suffix.lower() in {'.jpg', '.jpeg', '.png', '.bmp'}:
-        faces, annotated = predict(source, model, args.conf, args.iou, args.device)
-        save = out_dir / f"{source.stem}_annotated.jpg"
-        cv2.imwrite(str(save), annotated)
-        entry = {"file": source.name, "faces": faces}
-        json_path = out_dir / "results.json"
-        with open(json_path, "w") as f:
-            json.dump(entry, f, indent=2)
-        print(f"  {source.name}: {len(faces)} face(s) → {save}")
-        print(f"  Results → {json_path}")
+    results = []
+    for path in images:
+        image = cv2.imread(str(path))
+        if image is None:
+            print(f"  skipped (unreadable): {path.name}", file=sys.stderr)
+            continue
+        faces = predict(image, model, head, args.conf, args.iou,
+                        args.imgsz, args.device)
+        cv2.imwrite(str(out_dir / f"{path.stem}_annotated.jpg"),
+                    annotate(image, faces))
+        results.append({"file": path.name, "faces": faces})
+        print(f"  {path.name}: {len(faces)} face(s)")
 
-    # Directory
-    elif source.is_dir():
-        exts = {'.jpg', '.jpeg', '.png', '.bmp', '.tiff'}
-        images = sorted([f for f in source.iterdir() if f.suffix.lower() in exts])
-        all_results = []
+    json_path = out_dir / "results.json"
+    json_path.write_text(json.dumps(results, indent=2) + "\n")
+    print(f"  {len(results)} image(s) -> {json_path}")
 
-        for img in images:
-            try:
-                faces, annotated = predict(img, model, args.conf, args.iou, args.device)
-                save = out_dir / f"{img.stem}_annotated.jpg"
-                cv2.imwrite(str(save), annotated)
-                all_results.append({"file": img.name, "faces": faces})
-                print(f"  {img.name}: {len(faces)} face(s)")
-            except Exception as e:
-                print(f"  ✗ {img.name}: {e}")
 
-        json_path = out_dir / "results.json"
-        with open(json_path, "w") as f:
-            json.dump(all_results, f, indent=2)
-        print(f"\n  Total: {len(images)} images → {json_path}")
+def run_video(source, model, head, args, out_dir):
+    """Annotate a video.
 
-    # Video
-    elif source.suffix.lower() in {'.mp4', '.avi', '.mov', '.mkv'}:
-        cap = cv2.VideoCapture(str(source))
-        w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-        h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-        fps = cap.get(cv2.CAP_PROP_FPS) or 30
-        fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-        out_vid = out_dir / f"{source.stem}_annotated.mp4"
-        writer = cv2.VideoWriter(str(out_vid), fourcc, fps, (w, h))
-        frame_idx = 0
-
-        try:
-            while True:
-                ret, frame = cap.read()
-                if not ret:
-                    break
-                ret = model([frame], imgsz=640, conf=args.conf, iou=iou,
-                            device=args.device, verbose=False, stream=True)
-                writer.write(frame)
-                frame_idx += 1
-        finally:
-            cap.release()
-            writer.release()
-
-        print(f"  {source.name}: {frame_idx} frames → {out_vid}")
+    The previous version called the model with stream=True, never consumed the
+    returned generator -- so inference never actually ran -- and wrote the
+    untouched input frame to the output file.
+    """
+    cap = cv2.VideoCapture(str(source))
+    if not cap.isOpened():
+        raise SystemExit(f"Cannot open video: {source}")
+    w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+    out_path = out_dir / f"{source.stem}_annotated.mp4"
+    writer = cv2.VideoWriter(str(out_path), cv2.VideoWriter_fourcc(*"mp4v"),
+                             fps, (w, h))
+    n = 0
+    try:
+        while True:
+            ok, frame = cap.read()
+            if not ok:
+                break
+            faces = predict(frame, model, head, args.conf, args.iou,
+                            args.imgsz, args.device)
+            writer.write(annotate(frame, faces))
+            n += 1
+    finally:
+        cap.release()
+        writer.release()
+    print(f"  {source.name}: {n} frames -> {out_path}")
 
 
 if __name__ == "__main__":

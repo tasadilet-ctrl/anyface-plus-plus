@@ -25,4 +25,5 @@ dependencies = [
 dev = ["pytest>=7.0"]
 
 [tool.setuptools]
-packages = ["anyface_pp", "anyface_pp.models", "anyface_pp.utils"]
+packages = ["anyface_pp", "anyface_pp.models", "anyface_pp.utils",
+            "yolo26_mtl", "yolo26_mtl.head_module"]
