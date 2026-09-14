@@ -131,6 +131,82 @@ can be rerun. A checkpoint records the code it was trained with, and
 decoding a binary model as ordinal would return quiet nonsense.
 
 
+## Class imbalance, and how the mood trainer scored itself
+
+`train_mood.py` ran, unlike the age trainer — but three things about how it
+measured itself meant the number it selected checkpoints on was not measuring
+what it claimed. All of the figures below are reproduced by
+`benchmarks/mood_metrics.py`, which CI reruns.
+
+### Validation was scored through the training augmentations
+
+The split used `torch.utils.data.random_split`, which hands back two views of
+one dataset object. That object carried the training transform, so the
+validation half was evaluated through `RandomHorizontalFlip` and
+`RandomRotation(10)`. Evaluating one fixed model on one fixed set of images:
+
+| validation transform | accuracy | macro-F1 | spread over repeats |
+|---|---|---|---|
+| training (augmented) | 0.660 | 0.405 | **0.082 / 0.121** |
+| evaluation (clean) | 0.689 | 0.453 | 0.000 / 0.000 |
+
+Same weights, same images, nothing changing but the dice. An 8-point accuracy
+band is wider than the gap between many real checkpoints, so "best epoch" was
+partly a lottery. The trainer now builds a second dataset object with a
+deterministic transform and indexes it with `Subset`.
+
+### Accuracy barely notices a class being dropped
+
+FER2013 is 1.52% `disgusted`. An otherwise-perfect model that never emits that
+label at all scores:
+
+| dropped class | share of data | accuracy | macro-F1 |
+|---|---|---|---|
+| disgusted | 1.52% | **0.985** | 0.851 |
+| surprised | 11.15% | 0.889 | 0.822 |
+| happy | 25.05% | 0.750 | 0.796 |
+
+Accuracy's penalty is just the class's share — 1.5% for ignoring an entire
+emotion. Macro-F1 averages over classes instead of samples, so the same
+failure costs 14.9%, a 10x stronger signal, and it stays near-flat (0.80–0.85)
+regardless of *which* class is dropped while accuracy ranges 0.75–0.98.
+Checkpoints are now selected on macro-F1, and every epoch prints per-class
+recall plus any class the model never predicted.
+
+### An unstratified split can hide the rare class entirely
+
+A uniform 20% split, by dataset size:
+
+| images | `disgusted` samples | P(none in validation) |
+|---|---|---|
+| 200 | 3 | **50.7%** |
+| 500 | 8 | 17.8% |
+| 1,000 | 15 | 3.6% |
+| 35,887 (full) | 547 | 0.0% |
+
+The full dataset is safe. Quick runs on a few hundred images are not — and
+that is exactly when a split gets taken at random. `stratified_split` now
+guarantees every class present appears on both sides.
+
+### The backbone was training from scratch
+
+`mood_classifier.py` imported `MobileNet_V2_Weights` and then called
+`mobilenet_v2(weights=None)`, so the import was dead and training started from
+random initialisation. `_MoodNet(pretrained=True)` is now available and
+`train_mood.py` defaults to it; `--from-scratch` restores the old behaviour.
+The inference path still defaults to `pretrained=False`, since a checkpoint
+overwrites the backbone anyway and constructing a `MoodClassifier` should not
+trigger a download.
+
+I have not measured what ImageNet initialisation is worth on FER2013 here —
+that needs the dataset, which this repo does not redistribute. The claim is
+only that the previous behaviour was unintended, which the unused import
+shows.
+
+`--class-weights` adds inverse-frequency weighting to the loss for anyone who
+wants to push further on the rare classes.
+
+
 ## Architecture
 
 ```
@@ -270,6 +346,10 @@ python train_mood.py \
     --epochs 30 --batch-size 64 --device cuda
 ```
 
+Selects on macro-F1, splits stratified, and starts from ImageNet weights.
+Useful flags: `--class-weights` (inverse-frequency loss weighting),
+`--from-scratch` (random backbone init), `--history-json` (per-epoch metrics).
+
 ## API Usage
 
 ```python
@@ -298,6 +378,11 @@ anyface-plus-plus/
 ├── train_age.py            # Age estimator training script
 ├── train_mood.py           # Mood classifier training script
 ├── benchmarks/
+│   ├── age_encoding.py     # ordinal vs binary age codes (exact, no data)
+│   ├── age_encoding_train.py  # the same comparison under training
+│   └── mood_metrics.py     # imbalance: accuracy vs macro-F1, split risk
+├── tests/                  # offline; no weights or datasets required
+├── benchmarks/
 │   ├── age_encoding.py     # Cost of a wrong unit under each age code (CI)
 │   └── age_encoding_train.py  # Both codes trained on one identical task
 ├── tests/                  # Offline: no weights, no dataset, no GPU
@@ -321,7 +406,9 @@ anyface-plus-plus/
     │   ├── age_estimator.py # Ordinal-code age CNN
     │   └── mood_classifier.py  # MobileNetV2 emotion classifier
     └── utils/
-        └── visualizer.py    # Bounding box + label drawing
+        ├── visualizer.py    # Bounding box + label drawing
+        ├── metrics.py       # macro-F1, per-class recall, confusion matrix
+        └── splits.py        # stratified train/val split
 ```
 
 ## Datasets

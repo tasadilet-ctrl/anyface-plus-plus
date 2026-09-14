@@ -37,11 +37,21 @@ INPUT_SIZE = 224
 
 
 class _MoodNet(nn.Module):
-    """MobileNetV2 backbone → single FC head for 7-class emotion."""
+    """MobileNetV2 backbone with a single FC head for 7-class emotion.
 
-    def __init__(self, num_classes: int = len(EMOTION_LABELS)):
+    ``pretrained`` selects ImageNet initialisation. It defaults to False so
+    that constructing a MoodClassifier never triggers a surprise download --
+    for inference the backbone is overwritten by the checkpoint anyway. For
+    training it should be True, and train_mood.py defaults it that way:
+    MobileNet_V2_Weights was imported by this module but never used, so the
+    network was being trained from scratch.
+    """
+
+    def __init__(self, num_classes: int = len(EMOTION_LABELS),
+                 pretrained: bool = False):
         super().__init__()
-        backbone = mobilenet_v2(weights=None)
+        weights = MobileNet_V2_Weights.IMAGENET1K_V1 if pretrained else None
+        backbone = mobilenet_v2(weights=weights)
         self.features = backbone.features
         self._classifier_in = backbone.classifier[1].in_features
         backbone.classifier = nn.Sequential()  # drop original head

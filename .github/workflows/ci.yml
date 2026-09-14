@@ -40,6 +40,11 @@ jobs:
         # Pure arithmetic over the codes -- no data, no weights, deterministic.
         run: python3 benchmarks/age_encoding.py
 
+      - name: Recompute the mood-metric comparison
+        # Reproduces the numbers in the README's "Class imbalance" section
+        # from FER2013's published class counts. No images needed.
+        run: python3 benchmarks/mood_metrics.py
+
       - name: Check entry points are importable
         run: |
           python -c "from anyface_pp.models.face_detector import FaceDetector; print('ok')"
